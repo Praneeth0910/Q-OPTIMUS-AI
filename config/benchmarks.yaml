@@ -1,0 +1,105 @@
+benchmarks:
+  INVSQRT:
+    name: "INVSQRT"
+    objective: "Reversible fixed-point inverse-square-root phasing"
+    verifier_path: "official/verifiers/invsqrt/verifiers/invsqrt/verify_submission_invsqrt.py"
+    candidate_structure: "single .kmb circuit artifact"
+    baseline:
+      reference_artifact: "official/reference/sample_submission/invsqrt.kmb"
+      reference_sha256: "e2bf8eb64350a4460a271fc7f1d591ef125b1e276377e9a0f64b96ab3ca321e1"
+      verification_status: "PASS"
+      official_score: 2076774.233715282
+      resource_metrics:
+        qubits: 260
+        toffoli_count: 7735
+        t_count: 1
+        rotation_count: 37
+        rotation_epsilon: 1.5289254939242122e-12
+        toffoli_equivalent_count: 7987.593206597238
+        reaction_depth: 4005
+        instruction_count: 62160
+        verified_shots: 200540928
+        worst_error_over_tolerance: 0.4769116097939472
+        worst_x: 2588411
+      verification_parameters:
+        n_p: 10
+        beta: 1
+        precision_bits: 24
+        shots_per_x: 64
+        batch_size: 256
+        max_workers: 1
+      runtime_seconds: 743.71
+      peak_memory_kb: 524400
+      recorded_at: null
+      source: "Phase 1 historical official verifier record supplied in execution prompt"
+      values_verified: true
+  DQI:
+    name: "DQI"
+    objective: "Decoded Quantum Interferometry"
+    verifier_path: "official/verifiers/dqi/verify_submission_dqi.py"
+    candidate_structure: "single .kmb circuit artifact"
+    baseline:
+      reference_artifact: "official/reference/sample_submission/dqi.kmb"
+      reference_sha256: "959471d05a26373b4f14ca0cae2d8639ea25f18170d9f6532139aa51ccc04995"
+      verification_status: "PASS"
+      official_score: 24439463583672.93
+      resource_metrics:
+        qubits: 1893
+        classical_bits: 49154
+        instruction_count: 86051014
+        toffoli_like_operations: 5725461
+        reaction_depth: 170757
+        verified_shots: 102400
+        value_errors: 0
+        phase_errors: 0
+        empirical_error_rate: 0.0
+        effective_error_rate: 0.0008660587301657926
+        repetition_factor: 1.1912604648115832
+        mean_error_weight: 31.046737331746634
+        mean_toffoli_count: 5725108.382109375
+        maximum_toffoli_count: 5725461
+      verification_parameters:
+        m: 4095
+        n: 70
+        degree: 12
+        r: 2016
+        num_shots: 102400
+        batch_size: 256
+        log2_delta: -128
+        max_workers: 1
+      runtime_seconds: 308.71
+      peak_memory_kb: 7609960
+      recorded_at: null
+      source: "Phase 1 historical official verifier record supplied in execution prompt"
+      values_verified: true
+  DFTHCSOS:
+    name: "DFTHCSOS"
+    objective: "FeMoco Hamiltonian block encoding"
+    verifier_path: "official/verifiers/dfthcsos/verify.py"
+    candidate_structure: "directory containing angle_k_0.kmb through angle_k_9.kmb and submission.npz"
+    baseline:
+      reference_artifact: "official/reference/sample_submission/dfthcsos"
+      reference_sha256: "not-applicable-directory-reference"
+      verification_status: "PASS"
+      official_score: 3355599588.3155375
+      resource_metrics:
+        qubits: 730
+        toffoli_count: 93237
+        lambda_effective: 49.30136925057439
+        reaction_depth: 110
+        instruction_count: 2060743
+        verified_shots: 254464
+        number_of_angle_circuits: 10
+        error_1: 0.0031851950317977845
+        error_2: 0.018639570630974118
+        lambda: 308.45593973309445
+        energy_gap: 3.965477244291833
+      verification_parameters:
+        R: 65
+        B: 60
+        C: 60
+      runtime_seconds: 33.91
+      peak_memory_kb: 1117608
+      recorded_at: null
+      source: "Phase 1 historical official verifier record supplied in execution prompt"
+      values_verified: true

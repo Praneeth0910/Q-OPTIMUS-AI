@@ -23,7 +23,17 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-import weave
+try:
+    import weave
+except (ImportError, OSError):
+    class _NoOpWeave:
+        @staticmethod
+        def op(*args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+
+    weave = _NoOpWeave()
 
 from agents.researcher import ResearcherAgent
 from project_config import get_config
@@ -101,6 +111,19 @@ class MainAgent:
             (self.ideas_dir / "INDEX.md").write_text("# Idea pool\n\n")
         if not self.main_md_path.exists():
             self.main_md_path.write_text(f"# {goal_text}\n", encoding="utf-8")
+
+    def create_experiment_runner(self):
+        """Return the Phase 2 evaluation composition without changing the LLM loop."""
+
+        from engine.experiment_runner import ExperimentRunner
+        from evaluation.pareto_archive import ParetoArchive
+        from storage.experiment_tracker import ExperimentTracker
+
+        database_path = Path(__file__).resolve().parents[1] / "storage" / "qoptimus.db"
+        return ExperimentRunner(
+            tracker=ExperimentTracker(database_path),
+            archive=ParetoArchive(),
+        )
 
     @weave.op()
     def run(self) -> None:
