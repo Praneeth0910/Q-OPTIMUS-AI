@@ -274,9 +274,10 @@ def _parse_json_output(stdout: str) -> dict[str, Any] | None:
             value, end = decoder.raw_decode(stdout[index:])
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and end > parsed_length:
+        absolute_end = index + end
+        if isinstance(value, dict) and absolute_end > parsed_length:
             parsed = value
-            parsed_length = end
+            parsed_length = absolute_end
     return parsed
 
 
