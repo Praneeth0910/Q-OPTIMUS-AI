@@ -24,6 +24,35 @@ except ImportError:
     psutil = None
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+RUNTIME_ROOT = REPOSITORY_ROOT / ".runtime"
+VERIFIER_ENVIRONMENT_FILE = REPOSITORY_ROOT / "config" / "verifier-environment.txt"
+APPROVED_WSL_PYTHON_FALLBACK = (
+    "/home/praneeth_0910/projects/q-optimus-quantum/.venv-kickmix/bin/python"
+)
+
+
+def _resolve_wsl_python() -> str:
+    configured = os.environ.get("Q_OPTIMUS_WSL_PYTHON")
+    if configured is None and VERIFIER_ENVIRONMENT_FILE.is_file():
+        for line in VERIFIER_ENVIRONMENT_FILE.read_text(
+            encoding="utf-8"
+        ).splitlines():
+            if line.startswith("wsl_python="):
+                configured = line.partition("=")[2].strip()
+                break
+    interpreter = configured or APPROVED_WSL_PYTHON_FALLBACK
+    if (
+        not interpreter.startswith("/")
+        or "/.venv" not in interpreter
+        or not interpreter.endswith("/bin/python")
+    ):
+        raise RuntimeError(
+            "Q_OPTIMUS_WSL_PYTHON must be an absolute approved WSL interpreter path"
+        )
+    return interpreter
+
+
 class VerificationStatus(StrEnum):
     PASS = "PASS"
     FAIL = "FAIL"
@@ -75,9 +104,14 @@ class VerifierAdapter:
     _dqi_lock = threading.Lock()
 
     def _pid_file(self) -> Path:
-        runtime_root = Path(r"D:\Projects\Q-OPTIMUS-AI\.runtime")
+        runtime_root = Path(
+            os.environ.get("Q_OPTIMUS_RUNTIME_DIR", str(RUNTIME_ROOT))
+        ).resolve()
         runtime_root.mkdir(parents=True, exist_ok=True)
         return runtime_root / f"wsl-verifier-{uuid4().hex}.pid"
+
+    def _wsl_python(self) -> str:
+        return _resolve_wsl_python()
 
     def build_command(self, request: VerificationRequest) -> tuple[str, ...]:
         benchmark = get_benchmark(request.benchmark_id)
@@ -359,7 +393,7 @@ class VerifierAdapter:
             "env",
             "PYTHONPATH=/home/praneeth_0910/projects/q-optimus-quantum/official/kickmix/kickmix",
             f"Q_OPTIMUS_WSL_PID_FILE={_to_wsl_path(pid_file)}",
-            "/home/praneeth_0910/projects/q-optimus-quantum/.venv-kickmix/bin/python",
+            _resolve_wsl_python(),
             "/mnt/d/Projects/Q-OPTIMUS-AI/evaluation/wsl_verifier_runner.py",
             "--request",
             "-",
@@ -454,7 +488,7 @@ if starttime(record["runner_pid"]) == record["runner_starttime"]:
     os.kill(record["runner_pid"], signal.SIGKILL)
 """
     cleanup_command = (
-        "/home/praneeth_0910/projects/q-optimus-quantum/.venv-kickmix/bin/python",
+        _resolve_wsl_python(),
         "-c",
         cleanup_script,
     )

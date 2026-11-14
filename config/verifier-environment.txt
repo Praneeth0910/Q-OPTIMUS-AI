@@ -7,3 +7,4 @@ psutil==7.2.2
 kickmix==0.1
 # kickmix is the official native extension, loaded from:
 # /home/praneeth_0910/projects/q-optimus-quantum/official/kickmix/kickmix
+wsl_python=/home/praneeth_0910/projects/q-optimus-quantum/.venv-kickmix/bin/python

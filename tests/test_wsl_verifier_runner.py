@@ -112,6 +112,46 @@ def test_adapter_wsl_request_preserves_authorization_gate(tmp_path):
     assert result.status.value == "NOT_RUN"
 
 
+def test_runtime_and_wsl_interpreter_resolution(tmp_path, monkeypatch):
+    from evaluation.verifier_adapter import VerifierAdapter
+
+    adapter = VerifierAdapter()
+    monkeypatch.setenv("Q_OPTIMUS_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv(
+        "Q_OPTIMUS_WSL_PYTHON",
+        "/opt/q-optimus/.venv-verifier/bin/python",
+    )
+    first = adapter._pid_file()
+    second = adapter._pid_file()
+    assert first.parent == (tmp_path / "runtime").resolve()
+    assert first != second
+    assert adapter._wsl_python() == "/opt/q-optimus/.venv-verifier/bin/python"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["python", "/usr/bin/python", "/opt/python"],
+)
+def test_invalid_wsl_interpreter_is_rejected(monkeypatch, value):
+    from evaluation.verifier_adapter import VerifierAdapter
+
+    monkeypatch.setenv("Q_OPTIMUS_WSL_PYTHON", value)
+    with pytest.raises(RuntimeError, match="approved WSL interpreter"):
+        VerifierAdapter()._wsl_python()
+
+
+def test_missing_interpreter_config_uses_approved_fallback(monkeypatch):
+    import evaluation.verifier_adapter as adapter_module
+
+    monkeypatch.delenv("Q_OPTIMUS_WSL_PYTHON", raising=False)
+    monkeypatch.setattr(
+        adapter_module, "VERIFIER_ENVIRONMENT_FILE", Path("missing-environment.txt")
+    )
+    assert adapter_module.VerifierAdapter()._wsl_python().endswith(
+        "/.venv-kickmix/bin/python"
+    )
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="fcntl is Linux-only")
 def test_lock_timeout_and_release_after_exception(tmp_path, monkeypatch):
     lock_path = tmp_path / "dqi.lock"
@@ -376,7 +416,7 @@ def test_real_windows_to_wsl_timeout_lifecycle(tmp_path, monkeypatch):
                 "env",
                 "PYTHONPATH=/mnt/d/Projects/Q-OPTIMUS-AI",
                 f"Q_OPTIMUS_WSL_PID_FILE={_to_wsl_path(pid_path)}",
-                "/home/praneeth_0910/projects/q-optimus-quantum/.venv-kickmix/bin/python",
+                self._wsl_python(),
                 _to_wsl_path(helper),
                 "--request",
                 "-",
