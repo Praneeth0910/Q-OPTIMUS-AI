@@ -90,6 +90,7 @@ def test_execute_command_timeout_is_explicit(monkeypatch):
     result = runner.execute_command(
         (sys.executable, "-c", "import time; time.sleep(2)"),
         timeout_seconds=0.01,
+        pid_file=None,
     )
     assert result["timed_out"] is True
     assert result["exit_code"] is not None
@@ -191,10 +192,19 @@ def test_adapter_timeout_requests_linux_group_cleanup(tmp_path, monkeypatch):
     candidate.write_bytes(b"candidate")
     pid_file = tmp_path / "pid.json"
     pid_file.write_text(
-        json.dumps({"runner_pid": 101, "verifier_pid": 202, "verifier_pgid": 202}),
+        json.dumps(
+            {
+                "runner_pid": 101,
+                "verifier_pid": 202,
+                "verifier_pgid": 202,
+                "runner_starttime": 1,
+                "verifier_starttime": 2,
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setenv("Q_OPTIMUS_WSL_PID_FILE", str(pid_file))
+    monkeypatch.setattr(VerifierAdapter, "_pid_file", lambda self: pid_file)
     fake_process = Mock()
     fake_process.returncode = -9
     fake_process.communicate.side_effect = [
@@ -203,7 +213,15 @@ def test_adapter_timeout_requests_linux_group_cleanup(tmp_path, monkeypatch):
     ]
     def fake_popen(*args, **kwargs):
         pid_file.write_text(
-            json.dumps({"runner_pid": 101, "verifier_pid": 202, "verifier_pgid": 202}),
+            json.dumps(
+                {
+                    "runner_pid": 101,
+                    "verifier_pid": 202,
+                    "verifier_pgid": 202,
+                    "runner_starttime": 1,
+                    "verifier_starttime": 2,
+                }
+            ),
             encoding="utf-8",
         )
         return fake_process
@@ -213,7 +231,7 @@ def test_adapter_timeout_requests_linux_group_cleanup(tmp_path, monkeypatch):
 
     def fake_run(command, **kwargs):
         kill_calls.append(command)
-        return Mock(returncode=1)
+        return Mock(returncode=0 if len(kill_calls) == 1 else 1)
 
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
     result = VerifierAdapter().run(
@@ -229,7 +247,7 @@ def test_adapter_timeout_requests_linux_group_cleanup(tmp_path, monkeypatch):
     )
     assert result.status.value == "TIMEOUT"
     assert kill_calls
-    assert any("-202" in part for call in kill_calls for part in call)
+    assert any("python" in part for call in kill_calls for part in call)
     fake_process.kill.assert_called_once()
     assert not pid_file.exists()
 
@@ -240,12 +258,15 @@ def test_pid_file_writer_is_atomic_and_valid(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner.os, "getpid", lambda: 11)
     monkeypatch.setattr(runner.os, "getpgid", lambda _pid: 22, raising=False)
+    monkeypatch.setattr(runner, "_proc_starttime", lambda pid: pid + 100)
     path = tmp_path / "nested" / "wsl-verifier.pid"
     runner._write_pid_file(path, Process())
     assert json.loads(path.read_text(encoding="utf-8")) == {
         "runner_pid": 11,
         "verifier_pid": 22,
         "verifier_pgid": 22,
+        "runner_starttime": 111,
+        "verifier_starttime": 122,
     }
     assert not list(path.parent.glob("*.tmp"))
 
@@ -277,7 +298,13 @@ def test_cleanup_failure_is_reported_and_record_retained(tmp_path, monkeypatch):
     path = tmp_path / "pid.json"
     path.write_text(
         json.dumps(
-            {"runner_pid": 11, "verifier_pid": 22, "verifier_pgid": 22}
+            {
+                "runner_pid": 11,
+                "verifier_pid": 22,
+                "verifier_pgid": 22,
+                "runner_starttime": 1,
+                "verifier_starttime": 2,
+            }
         ),
         encoding="utf-8",
     )
@@ -287,6 +314,34 @@ def test_cleanup_failure_is_reported_and_record_retained(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner.subprocess, "run", fail_cleanup)
     assert _terminate_wsl_process_tree(path) is False
+    assert path.exists()
+
+
+def test_stale_pid_identity_is_rejected_without_follow_up_kills(tmp_path, monkeypatch):
+    from evaluation.verifier_adapter import _terminate_wsl_process_tree
+
+    path = tmp_path / "stale.pid"
+    path.write_text(
+        json.dumps(
+            {
+                "runner_pid": 11,
+                "verifier_pid": 22,
+                "verifier_pgid": 22,
+                "runner_starttime": 101,
+                "verifier_starttime": 202,
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def stale_identity(command, **kwargs):
+        calls.append((command, kwargs))
+        return Mock(returncode=3)
+
+    monkeypatch.setattr(runner.subprocess, "run", stale_identity)
+    assert _terminate_wsl_process_tree(path) is False
+    assert len(calls) == 1
     assert path.exists()
 
 
@@ -311,6 +366,9 @@ def test_real_windows_to_wsl_timeout_lifecycle(tmp_path, monkeypatch):
     helper = Path(__file__).with_name("wsl_harmless_runner.py")
 
     class IntegrationAdapter(VerifierAdapter):
+        def _pid_file(self) -> Path:
+            return pid_file
+
         def _wsl_command(self, pid_path: Path) -> tuple[str, ...]:
             return (
                 "wsl.exe",

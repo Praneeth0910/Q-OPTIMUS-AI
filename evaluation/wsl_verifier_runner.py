@@ -177,7 +177,12 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
 
 def _write_pid_file(path: Path, process: subprocess.Popen[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    record: dict[str, int] = {"runner_pid": os.getpid(), "verifier_pid": process.pid}
+    record: dict[str, int] = {
+        "runner_pid": os.getpid(),
+        "verifier_pid": process.pid,
+        "runner_starttime": _proc_starttime(os.getpid()),
+        "verifier_starttime": _proc_starttime(process.pid),
+    }
     if hasattr(os, "getpgid"):
         record["verifier_pgid"] = os.getpgid(process.pid)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -192,6 +197,11 @@ def _write_pid_file(path: Path, process: subprocess.Popen[str]) -> None:
         os.replace(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def _proc_starttime(pid: int) -> int:
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    return int(stat.rsplit(")", 1)[1].split()[19])
 
 
 def _remove_pid_file(path: Path) -> None:

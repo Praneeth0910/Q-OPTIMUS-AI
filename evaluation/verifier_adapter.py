@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from uuid import uuid4
 from threading import Event, Thread
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -72,6 +73,11 @@ class VerifierAdapter:
     """Execute an official verifier without modifying its source or assets."""
 
     _dqi_lock = threading.Lock()
+
+    def _pid_file(self) -> Path:
+        runtime_root = Path(r"D:\Projects\Q-OPTIMUS-AI\.runtime")
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        return runtime_root / f"wsl-verifier-{uuid4().hex}.pid"
 
     def build_command(self, request: VerificationRequest) -> tuple[str, ...]:
         benchmark = get_benchmark(request.benchmark_id)
@@ -269,14 +275,7 @@ class VerifierAdapter:
             "extra_args": list(request.extra_args),
         }
         started = time.monotonic()
-        pid_file = Path(
-            os.environ.get(
-                "Q_OPTIMUS_WSL_PID_FILE",
-                r"D:\Projects\Q-OPTIMUS-AI\.runtime\wsl-verifier.pid",
-            )
-        )
-        if pid_file.exists():
-            pid_file.unlink()
+        pid_file = self._pid_file()
         command = self._wsl_command(pid_file)
         try:
             process = subprocess.Popen(
@@ -415,27 +414,62 @@ def _terminate_wsl_process_tree(pid_file: Path) -> bool:
     verifier_pid = record.get("verifier_pid")
     verifier_pgid = record.get("verifier_pgid")
     runner_pid = record.get("runner_pid")
+    verifier_starttime = record.get("verifier_starttime")
+    runner_starttime = record.get("runner_starttime")
     if not all(
         isinstance(value, int) and value > 0
-        for value in (runner_pid, verifier_pid, verifier_pgid)
+        for value in (
+            runner_pid,
+            verifier_pid,
+            verifier_pgid,
+            runner_starttime,
+            verifier_starttime,
+        )
     ):
         return False
     if runner_pid == verifier_pid:
         return False
-    commands: list[tuple[str, ...]] = []
-    commands.append(("wsl.exe", "-e", "kill", "-KILL", "--", f"-{verifier_pgid}"))
-    for pid in (verifier_pid, runner_pid):
-        if isinstance(pid, int) and pid > 0:
-            commands.append(("wsl.exe", "-e", "kill", "-KILL", str(pid)))
+    cleanup_script = """\
+import json
+import os
+import signal
+import sys
+
+record = json.load(sys.stdin)
+
+def starttime(pid):
     try:
-        for command in commands:
-            subprocess.run(
-                command,
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        stat = open(f"/proc/{pid}/stat", encoding="ascii").read()
+        return int(stat.rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+if (
+    starttime(record["verifier_pid"]) != record["verifier_starttime"]
+    or starttime(record["runner_pid"]) != record["runner_starttime"]
+):
+    sys.exit(3)
+os.killpg(record["verifier_pgid"], signal.SIGKILL)
+if starttime(record["runner_pid"]) == record["runner_starttime"]:
+    os.kill(record["runner_pid"], signal.SIGKILL)
+"""
+    cleanup_command = (
+        "/home/praneeth_0910/projects/q-optimus-quantum/.venv-kickmix/bin/python",
+        "-c",
+        cleanup_script,
+    )
+    try:
+        cleanup = subprocess.run(
+            ("wsl.exe", "-e", *cleanup_command),
+            input=json.dumps(record),
+            text=True,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     except OSError:
+        return False
+    if cleanup.returncode != 0:
         return False
     probes: list[tuple[str, ...]] = []
     probes.append(("wsl.exe", "-e", "kill", "-0", "--", f"-{verifier_pgid}"))
