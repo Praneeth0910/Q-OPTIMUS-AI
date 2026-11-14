@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -72,14 +74,15 @@ def test_dqi_rejects_worker_override(tmp_path, monkeypatch):
     verifier.parent.mkdir(parents=True)
     verifier.write_text("print('{}')\n", encoding="utf-8")
     with pytest.raises(runner.RunnerInputError, match="worker count"):
-        runner._validate_request(
-            {
-                "benchmark_id": "DQI",
-                "candidate_artifact": str(candidate),
-                "authorized": True,
-                "extra_args": ["--max-workers", "4"],
-            }
-        )
+        for extra_args in (["--max-workers", "4"], ["--max-workers=4"]):
+            runner._validate_request(
+                {
+                    "benchmark_id": "DQI",
+                    "candidate_artifact": str(candidate),
+                    "authorized": True,
+                    "extra_args": extra_args,
+                }
+            )
 
 
 def test_execute_command_timeout_is_explicit(monkeypatch):
@@ -105,3 +108,150 @@ def test_adapter_wsl_request_preserves_authorization_gate(tmp_path):
     )
     result = VerifierAdapter().run(request)
     assert result.status.value == "NOT_RUN"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fcntl is Linux-only")
+def test_lock_timeout_and_release_after_exception(tmp_path, monkeypatch):
+    lock_path = tmp_path / "dqi.lock"
+    monkeypatch.setattr(runner, "DQI_LOCK_PATH", lock_path)
+    first = runner._lock_file(0.1)
+    try:
+        with pytest.raises(TimeoutError):
+            runner._lock_file(0.01)
+    finally:
+        import fcntl
+
+        fcntl.flock(first.fileno(), fcntl.LOCK_UN)
+        first.close()
+    second = runner._lock_file(0.1)
+    second.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fcntl is Linux-only")
+def test_lock_releases_when_command_spawn_fails(tmp_path, monkeypatch):
+    lock_path = tmp_path / "dqi.lock"
+    monkeypatch.setattr(runner, "DQI_LOCK_PATH", lock_path)
+    original = runner.subprocess.Popen
+
+    def fail_spawn(*args, **kwargs):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(runner.subprocess, "Popen", fail_spawn)
+    with pytest.raises(OSError):
+        runner.execute_command(("unused",), timeout_seconds=1, lock_dqi=True, pid_file=None)
+    monkeypatch.setattr(runner.subprocess, "Popen", original)
+    handle = runner._lock_file(0.1)
+    handle.close()
+
+
+def test_status_mapping_preserves_all_outcomes():
+    from evaluation.verifier_adapter import (
+        VerificationStatus,
+        _status_from_runner,
+    )
+
+    for name in ("PASS", "FAIL", "TIMEOUT", "ERROR", "NOT_RUN"):
+        expected = VerificationStatus[name]
+        assert _status_from_runner({"status": name}, 0) is expected
+    assert _status_from_runner({"status": "NOT_RUN"}, 2) is VerificationStatus.NOT_RUN
+
+
+def test_runner_main_exit_codes_for_input_and_verifier_outcomes(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["wsl_verifier_runner"])
+    monkeypatch.setattr(sys, "stdin", type("Input", (), {"read": lambda self: "{}"})())
+    assert runner.main() == 2
+    assert json.loads(capsys.readouterr().out)["status"] == "NOT_RUN"
+
+
+def test_runner_main_malformed_json_is_structured_error(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["wsl_verifier_runner"])
+    monkeypatch.setattr(sys, "stdin", type("Input", (), {"read": lambda self: "{"})())
+    assert runner.main() == 1
+    response = json.loads(capsys.readouterr().out)
+    assert response["status"] == "ERROR"
+
+
+def test_runner_main_unexpected_error_is_structured(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["wsl_verifier_runner"])
+    monkeypatch.setattr(runner, "run_request", Mock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(
+        sys, "stdin", type("Input", (), {"read": lambda self: "{}"})()
+    )
+    assert runner.main() == 1
+    response = json.loads(capsys.readouterr().out)
+    assert response["status"] == "ERROR"
+    assert "RuntimeError" in response["error"]
+
+
+def test_adapter_timeout_requests_linux_group_cleanup(tmp_path, monkeypatch):
+    from evaluation.verifier_adapter import VerificationRequest, VerifierAdapter
+
+    candidate = tmp_path / "candidate.kmb"
+    candidate.write_bytes(b"candidate")
+    pid_file = tmp_path / "pid.json"
+    pid_file.write_text(
+        json.dumps({"runner_pid": 101, "verifier_pid": 202, "verifier_pgid": 202}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("Q_OPTIMUS_WSL_PID_FILE", str(pid_file))
+    fake_process = Mock()
+    fake_process.returncode = -9
+    fake_process.communicate.side_effect = [
+        runner.subprocess.TimeoutExpired("wsl.exe", 1),
+        ("", ""),
+    ]
+    def fake_popen(*args, **kwargs):
+        pid_file.write_text(
+            json.dumps({"runner_pid": 101, "verifier_pid": 202, "verifier_pgid": 202}),
+            encoding="utf-8",
+        )
+        return fake_process
+
+    monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
+    kill_calls = []
+
+    def fake_run(command, **kwargs):
+        kill_calls.append(command)
+        return Mock(returncode=1)
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    result = VerifierAdapter().run(
+        VerificationRequest(
+            "INVSQRT",
+            "candidate",
+            candidate,
+            tmp_path,
+            timeout_seconds=1,
+            authorized=True,
+            use_wsl_runner=True,
+        )
+    )
+    assert result.status.value == "TIMEOUT"
+    assert kill_calls
+    assert any("-202" in part for call in kill_calls for part in call)
+    fake_process.kill.assert_called_once()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Linux process-group behavior")
+def test_timeout_kills_child_process_group(tmp_path):
+    pid_file = tmp_path / "pid.json"
+    child_pid_file = tmp_path / "child.pid"
+    code = (
+        "import subprocess,sys,time; "
+        f"p=subprocess.Popen([sys.executable,'-c','import time,os; "
+        f"open(r\"{child_pid_file}\",\"w\").write(str(os.getpid())); time.sleep(30)']); "
+        "time.sleep(30)"
+    )
+    result = runner.execute_command(
+        (sys.executable, "-c", code),
+        timeout_seconds=0.1,
+        pid_file=pid_file,
+    )
+    assert result["timed_out"] is True
+    child_pid = int(child_pid_file.read_text())
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if not runner.psutil.pid_exists(child_pid):
+            break
+        time.sleep(0.05)
+    assert not runner.psutil.pid_exists(child_pid)

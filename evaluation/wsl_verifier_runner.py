@@ -43,6 +43,7 @@ APPLICATION_ROOT = Path("/mnt/d/Projects/Q-OPTIMUS-AI").resolve()
 DQI_LOCK_PATH = Path("/tmp/q-optimus-ai-dqi-verifier.lock")
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 0.05
+DEFAULT_PID_FILE = APPLICATION_ROOT / ".runtime" / "wsl-verifier.pid"
 
 
 class RunnerInputError(ValueError):
@@ -99,7 +100,10 @@ def _validate_request(request: dict[str, Any]) -> tuple[str, Path, tuple[str, ..
         isinstance(item, str) for item in extra_args
     ):
         raise RunnerInputError("extra_args must be a list of strings")
-    if benchmark.benchmark_id == "DQI" and "--max-workers" in extra_args:
+    if benchmark.benchmark_id == "DQI" and any(
+        item == "--max-workers" or item.startswith("--max-workers=")
+        for item in extra_args
+    ):
         raise RunnerInputError("DQI worker count is controlled by the runner")
     return benchmark.benchmark_id, candidate_path, tuple(extra_args), float(timeout)
 
@@ -165,6 +169,21 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
     process.wait()
 
 
+def _write_pid_file(path: Path, process: subprocess.Popen[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record: dict[str, int] = {"runner_pid": os.getpid(), "verifier_pid": process.pid}
+    if hasattr(os, "getpgid"):
+        record["verifier_pgid"] = os.getpgid(process.pid)
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+
+def _remove_pid_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _lock_file(timeout: float):
     if fcntl is None:
         raise RuntimeError("fcntl is required for the WSL verifier runner")
@@ -188,6 +207,7 @@ def execute_command(
     *,
     timeout_seconds: float,
     lock_dqi: bool = False,
+    pid_file: Path | None = DEFAULT_PID_FILE,
 ) -> dict[str, Any]:
     """Execute a command with process-group cleanup and resource reporting."""
     lock = _lock_file(DEFAULT_LOCK_TIMEOUT_SECONDS) if lock_dqi else None
@@ -204,6 +224,8 @@ def execute_command(
             text=True,
             start_new_session=True,
         )
+        if pid_file is not None:
+            _write_pid_file(Path(pid_file), process)
         if psutil is not None:
             from threading import Event, Thread
 
@@ -242,6 +264,8 @@ def execute_command(
         if lock is not None:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             lock.close()
+        if pid_file is not None:
+            _remove_pid_file(Path(pid_file))
 
 
 def run_request(request: dict[str, Any]) -> dict[str, Any]:
@@ -304,7 +328,19 @@ def main() -> int:
             "peak_memory_kb": None,
             "peak_memory_available": psutil is not None,
         }
+    except Exception as exc:  # runner boundary must always emit JSON
+        response = {
+            "status": "ERROR",
+            "error": f"{type(exc).__name__}: {exc}",
+            "peak_memory_kb": None,
+            "peak_memory_available": psutil is not None,
+        }
     print(json.dumps(response, sort_keys=True))
+    status = response["status"]
+    if status == "ERROR":
+        return 1
+    if status == "NOT_RUN":
+        return 2
     return 0
 
 

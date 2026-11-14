@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -278,6 +279,14 @@ class VerifierAdapter:
             "-",
         )
         started = time.monotonic()
+        pid_file = Path(
+            os.environ.get(
+                "Q_OPTIMUS_WSL_PID_FILE",
+                r"D:\Projects\Q-OPTIMUS-AI\.runtime\wsl-verifier.pid",
+            )
+        )
+        if pid_file.exists():
+            pid_file.unlink()
         try:
             process = subprocess.Popen(
                 command,
@@ -290,6 +299,7 @@ class VerifierAdapter:
                 json.dumps(payload), timeout=request.timeout_seconds + 5
             )
         except subprocess.TimeoutExpired:
+            cleanup_confirmed = _terminate_wsl_process_tree(pid_file)
             process.kill()
             stdout, stderr = process.communicate()
             return VerificationResult(
@@ -306,7 +316,11 @@ class VerifierAdapter:
                 peak_memory_kb=None,
                 stdout=stdout,
                 stderr=stderr,
-                error="WSL verifier runner timed out",
+                error=(
+                    "WSL verifier runner timed out"
+                    if cleanup_confirmed
+                    else "WSL verifier runner timed out; Linux process cleanup was not confirmed"
+                ),
                 official_run=request.official,
                 command=command,
             )
@@ -371,13 +385,69 @@ def _to_wsl_path(path: Path) -> str:
 
 
 def _status_from_runner(response: dict[str, Any], runner_exit_code: int) -> VerificationStatus:
-    if response.get("timed_out") or response.get("status") == "TIMEOUT":
+    reported = response.get("status")
+    if response.get("timed_out") or reported == "TIMEOUT":
         return VerificationStatus.TIMEOUT
-    if runner_exit_code != 0 or response.get("status") == "ERROR":
+    if reported == "NOT_RUN":
+        return VerificationStatus.NOT_RUN
+    if reported == "ERROR" or runner_exit_code != 0:
         return VerificationStatus.ERROR
-    if response.get("status") == "PASS":
+    if reported == "PASS":
         return VerificationStatus.PASS
-    return VerificationStatus.FAIL
+    if reported == "FAIL":
+        return VerificationStatus.FAIL
+    return VerificationStatus.ERROR
+
+
+def _terminate_wsl_process_tree(pid_file: Path) -> bool:
+    """Request Linux process-group cleanup through the WSL boundary."""
+    try:
+        record = json.loads(pid_file.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return False
+    verifier_pid = record.get("verifier_pid")
+    verifier_pgid = record.get("verifier_pgid")
+    runner_pid = record.get("runner_pid")
+    commands: list[tuple[str, ...]] = []
+    if isinstance(verifier_pgid, int) and verifier_pgid > 0:
+        commands.append(("wsl.exe", "-e", "kill", "-KILL", "--", f"-{verifier_pgid}"))
+    for pid in (verifier_pid, runner_pid):
+        if isinstance(pid, int) and pid > 0:
+            commands.append(("wsl.exe", "-e", "kill", "-KILL", str(pid)))
+    for command in commands:
+        subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    probes: list[tuple[str, ...]] = []
+    if isinstance(verifier_pgid, int) and verifier_pgid > 0:
+        probes.append(("wsl.exe", "-e", "kill", "-0", "--", f"-{verifier_pgid}"))
+    if isinstance(runner_pid, int) and runner_pid > 0:
+        probes.append(("wsl.exe", "-e", "kill", "-0", str(runner_pid)))
+    deadline = time.monotonic() + 1.0
+    while probes and time.monotonic() < deadline:
+        if all(
+            subprocess.run(
+                probe,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode != 0
+            for probe in probes
+        ):
+            return True
+        time.sleep(0.05)
+    return bool(probes) and all(
+        subprocess.run(
+            probe,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode != 0
+        for probe in probes
+    )
 
 
 def _parse_json_output(stdout: str) -> dict[str, Any] | None:
