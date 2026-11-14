@@ -268,16 +268,6 @@ class VerifierAdapter:
             "authorized": request.authorized,
             "extra_args": list(request.extra_args),
         }
-        command = (
-            "wsl.exe",
-            "-e",
-            "env",
-            "PYTHONPATH=/home/praneeth_0910/projects/q-optimus-quantum/official/kickmix/kickmix",
-            "/home/praneeth_0910/projects/q-optimus-quantum/.venv-kickmix/bin/python",
-            "/mnt/d/Projects/Q-OPTIMUS-AI/evaluation/wsl_verifier_runner.py",
-            "--request",
-            "-",
-        )
         started = time.monotonic()
         pid_file = Path(
             os.environ.get(
@@ -287,6 +277,7 @@ class VerifierAdapter:
         )
         if pid_file.exists():
             pid_file.unlink()
+        command = self._wsl_command(pid_file)
         try:
             process = subprocess.Popen(
                 command,
@@ -361,6 +352,20 @@ class VerifierAdapter:
             command=command,
         )
 
+    def _wsl_command(self, pid_file: Path) -> tuple[str, ...]:
+        """Build the production WSL runner command."""
+        return (
+            "wsl.exe",
+            "-e",
+            "env",
+            "PYTHONPATH=/home/praneeth_0910/projects/q-optimus-quantum/official/kickmix/kickmix",
+            f"Q_OPTIMUS_WSL_PID_FILE={_to_wsl_path(pid_file)}",
+            "/home/praneeth_0910/projects/q-optimus-quantum/.venv-kickmix/bin/python",
+            "/mnt/d/Projects/Q-OPTIMUS-AI/evaluation/wsl_verifier_runner.py",
+            "--request",
+            "-",
+        )
+
 
 def _digest(path: Path) -> str:
     if path.is_dir():
@@ -405,30 +410,55 @@ def _terminate_wsl_process_tree(pid_file: Path) -> bool:
         record = json.loads(pid_file.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return False
+    if not isinstance(record, dict):
+        return False
     verifier_pid = record.get("verifier_pid")
     verifier_pgid = record.get("verifier_pgid")
     runner_pid = record.get("runner_pid")
+    if not all(
+        isinstance(value, int) and value > 0
+        for value in (runner_pid, verifier_pid, verifier_pgid)
+    ):
+        return False
+    if runner_pid == verifier_pid:
+        return False
     commands: list[tuple[str, ...]] = []
-    if isinstance(verifier_pgid, int) and verifier_pgid > 0:
-        commands.append(("wsl.exe", "-e", "kill", "-KILL", "--", f"-{verifier_pgid}"))
+    commands.append(("wsl.exe", "-e", "kill", "-KILL", "--", f"-{verifier_pgid}"))
     for pid in (verifier_pid, runner_pid):
         if isinstance(pid, int) and pid > 0:
             commands.append(("wsl.exe", "-e", "kill", "-KILL", str(pid)))
-    for command in commands:
-        subprocess.run(
-            command,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+    try:
+        for command in commands:
+            subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except OSError:
+        return False
     probes: list[tuple[str, ...]] = []
-    if isinstance(verifier_pgid, int) and verifier_pgid > 0:
-        probes.append(("wsl.exe", "-e", "kill", "-0", "--", f"-{verifier_pgid}"))
-    if isinstance(runner_pid, int) and runner_pid > 0:
-        probes.append(("wsl.exe", "-e", "kill", "-0", str(runner_pid)))
+    probes.append(("wsl.exe", "-e", "kill", "-0", "--", f"-{verifier_pgid}"))
+    probes.append(("wsl.exe", "-e", "kill", "-0", str(runner_pid)))
     deadline = time.monotonic() + 1.0
     while probes and time.monotonic() < deadline:
-        if all(
+        try:
+            if all(
+                subprocess.run(
+                    probe,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                ).returncode != 0
+                for probe in probes
+            ):
+                pid_file.unlink(missing_ok=True)
+                return True
+        except OSError:
+            return False
+        time.sleep(0.05)
+    try:
+        confirmed = bool(probes) and all(
             subprocess.run(
                 probe,
                 check=False,
@@ -436,18 +466,15 @@ def _terminate_wsl_process_tree(pid_file: Path) -> bool:
                 stderr=subprocess.DEVNULL,
             ).returncode != 0
             for probe in probes
-        ):
-            return True
-        time.sleep(0.05)
-    return bool(probes) and all(
-        subprocess.run(
-            probe,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode != 0
-        for probe in probes
-    )
+        )
+    except OSError:
+        return False
+    if confirmed:
+        try:
+            pid_file.unlink(missing_ok=True)
+        except OSError:
+            return False
+    return confirmed
 
 
 def _parse_json_output(stdout: str) -> dict[str, Any] | None:

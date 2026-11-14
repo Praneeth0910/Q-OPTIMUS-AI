@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import sys
 import time
 from unittest.mock import Mock
@@ -230,6 +231,171 @@ def test_adapter_timeout_requests_linux_group_cleanup(tmp_path, monkeypatch):
     assert kill_calls
     assert any("-202" in part for call in kill_calls for part in call)
     fake_process.kill.assert_called_once()
+    assert not pid_file.exists()
+
+
+def test_pid_file_writer_is_atomic_and_valid(tmp_path, monkeypatch):
+    class Process:
+        pid = 22
+
+    monkeypatch.setattr(runner.os, "getpid", lambda: 11)
+    monkeypatch.setattr(runner.os, "getpgid", lambda _pid: 22, raising=False)
+    path = tmp_path / "nested" / "wsl-verifier.pid"
+    runner._write_pid_file(path, Process())
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "runner_pid": 11,
+        "verifier_pid": 22,
+        "verifier_pgid": 22,
+    }
+    assert not list(path.parent.glob("*.tmp"))
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "not-json",
+        {},
+        {"runner_pid": 11, "verifier_pid": 22},
+        {"runner_pid": 11, "verifier_pid": 11, "verifier_pgid": 22},
+    ],
+)
+def test_cleanup_rejects_malformed_or_unsafe_pid_records(tmp_path, record):
+    from evaluation.verifier_adapter import _terminate_wsl_process_tree
+
+    path = tmp_path / "pid.json"
+    path.write_text(
+        record if isinstance(record, str) else json.dumps(record),
+        encoding="utf-8",
+    )
+    assert _terminate_wsl_process_tree(path) is False
+    assert path.exists()
+
+
+def test_cleanup_failure_is_reported_and_record_retained(tmp_path, monkeypatch):
+    from evaluation.verifier_adapter import _terminate_wsl_process_tree
+
+    path = tmp_path / "pid.json"
+    path.write_text(
+        json.dumps(
+            {"runner_pid": 11, "verifier_pid": 22, "verifier_pgid": 22}
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_cleanup(*args, **kwargs):
+        raise OSError("wsl unavailable")
+
+    monkeypatch.setattr(runner.subprocess, "run", fail_cleanup)
+    assert _terminate_wsl_process_tree(path) is False
+    assert path.exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" and not Path(r"C:\Windows\System32\wsl.exe").exists(),
+    reason="WSL is unavailable",
+)
+def test_real_windows_to_wsl_timeout_lifecycle(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from evaluation.verifier_adapter import (
+        VerificationRequest,
+        VerificationStatus,
+        VerifierAdapter,
+        _to_wsl_path,
+    )
+
+    candidate = tmp_path / "candidate.kmb"
+    candidate.write_bytes(b"harmless integration candidate")
+    pid_file = tmp_path / "integration.pid"
+    monkeypatch.setenv("Q_OPTIMUS_WSL_PID_FILE", str(pid_file))
+    helper = Path(__file__).with_name("wsl_harmless_runner.py")
+
+    class IntegrationAdapter(VerifierAdapter):
+        def _wsl_command(self, pid_path: Path) -> tuple[str, ...]:
+            return (
+                "wsl.exe",
+                "-e",
+                "env",
+                "PYTHONPATH=/mnt/d/Projects/Q-OPTIMUS-AI",
+                f"Q_OPTIMUS_WSL_PID_FILE={_to_wsl_path(pid_path)}",
+                "/home/praneeth_0910/projects/q-optimus-quantum/.venv-kickmix/bin/python",
+                _to_wsl_path(helper),
+                "--request",
+                "-",
+            )
+
+    request = VerificationRequest(
+        "INVSQRT",
+        "harmless-integration",
+        candidate,
+        tmp_path,
+        timeout_seconds=5,
+        authorized=True,
+        use_wsl_runner=True,
+    )
+    results: list[tuple[object, float]] = []
+    unrelated_process = subprocess.Popen(
+        (
+            "wsl.exe",
+            "-e",
+            "sh",
+            "-c",
+            "setsid sleep 120 >/dev/null 2>&1 & echo $!; wait",
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    assert unrelated_process.stdout is not None
+    unrelated_pid = int(unrelated_process.stdout.readline().strip())
+    try:
+        for index in range(2):
+            started = time.monotonic()
+            result = IntegrationAdapter().run(
+                replace(request, candidate_id=f"run-{index}")
+            )
+            duration = time.monotonic() - started
+            results.append((result, duration))
+            assert result.status is VerificationStatus.TIMEOUT
+            assert result.status is not VerificationStatus.PASS
+            assert result.verifier_exit_code == -9
+            assert pid_file.exists() is False
+            child_pid = int((tmp_path / "harmless-child.pid").read_text())
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                probe = subprocess.run(
+                    ("wsl.exe", "-e", "kill", "-0", str(child_pid)),
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if probe.returncode != 0:
+                    break
+                time.sleep(0.05)
+            assert subprocess.run(
+                ("wsl.exe", "-e", "kill", "-0", str(child_pid)),
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode != 0
+            assert subprocess.run(
+                ("wsl.exe", "-e", "kill", "-0", str(unrelated_pid)),
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode == 0
+            assert duration >= 5
+    finally:
+        pid_file.unlink(missing_ok=True)
+        subprocess.run(
+            ("wsl.exe", "-e", "kill", "-KILL", str(unrelated_pid)),
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        unrelated_process.terminate()
+        unrelated_process.communicate(timeout=5)
+    assert len(results) == 2
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Linux process-group behavior")

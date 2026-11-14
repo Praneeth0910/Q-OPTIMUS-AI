@@ -15,6 +15,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Sequence
 
@@ -43,7 +44,12 @@ APPLICATION_ROOT = Path("/mnt/d/Projects/Q-OPTIMUS-AI").resolve()
 DQI_LOCK_PATH = Path("/tmp/q-optimus-ai-dqi-verifier.lock")
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 0.05
-DEFAULT_PID_FILE = APPLICATION_ROOT / ".runtime" / "wsl-verifier.pid"
+DEFAULT_PID_FILE = Path(
+    os.environ.get(
+        "Q_OPTIMUS_WSL_PID_FILE",
+        str(APPLICATION_ROOT / ".runtime" / "wsl-verifier.pid"),
+    )
+)
 
 
 class RunnerInputError(ValueError):
@@ -174,7 +180,18 @@ def _write_pid_file(path: Path, process: subprocess.Popen[str]) -> None:
     record: dict[str, int] = {"runner_pid": os.getpid(), "verifier_pid": process.pid}
     if hasattr(os, "getpgid"):
         record["verifier_pgid"] = os.getpgid(process.pid)
-    path.write_text(json.dumps(record), encoding="utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _remove_pid_file(path: Path) -> None:
