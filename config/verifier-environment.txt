@@ -1,0 +1,9 @@
+# Observed in the approved WSL verifier environment.
+# Generated during Phase C3/D; these are compatibility records, not install pins.
+python==3.13.18
+numpy==2.5.4
+scipy==1.18.1
+psutil==7.2.2
+kickmix==0.1
+# kickmix is the official native extension, loaded from:
+# /home/praneeth_0910/projects/q-optimus-quantum/official/kickmix/kickmix

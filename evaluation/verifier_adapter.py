@@ -42,6 +42,7 @@ class VerificationRequest:
     official: bool = True
     authorized: bool = False
     extra_args: tuple[str, ...] = ()
+    use_wsl_runner: bool = False
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,8 @@ class VerifierAdapter:
                 "Verification requires explicit authorization",
                 VerificationStatus.NOT_RUN,
             )
+        if request.use_wsl_runner:
+            return self._run_wsl(request, benchmark_id)
         try:
             command = self.build_command(request)
         except (FileNotFoundError, IsADirectoryError) as exc:
@@ -248,6 +251,102 @@ class VerifierAdapter:
             command=tuple(command),
         )
 
+    def _run_wsl(
+        self, request: VerificationRequest, benchmark_id: str
+    ) -> VerificationResult:
+        if not request.authorized:
+            return self._error_result(
+                request,
+                "Verification requires explicit authorization",
+                VerificationStatus.NOT_RUN,
+            )
+        payload = {
+            "benchmark_id": benchmark_id,
+            "candidate_artifact": _to_wsl_path(request.candidate_artifact),
+            "timeout_seconds": request.timeout_seconds,
+            "authorized": request.authorized,
+            "extra_args": list(request.extra_args),
+        }
+        command = (
+            "wsl.exe",
+            "-e",
+            "env",
+            "PYTHONPATH=/home/praneeth_0910/projects/q-optimus-quantum/official/kickmix/kickmix",
+            "/home/praneeth_0910/projects/q-optimus-quantum/.venv-kickmix/bin/python",
+            "/mnt/d/Projects/Q-OPTIMUS-AI/evaluation/wsl_verifier_runner.py",
+            "--request",
+            "-",
+        )
+        started = time.monotonic()
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout, stderr = process.communicate(
+                json.dumps(payload), timeout=request.timeout_seconds + 5
+            )
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            return VerificationResult(
+                benchmark_id=benchmark_id,
+                candidate_id=request.candidate_id,
+                status=VerificationStatus.TIMEOUT,
+                official_score=None,
+                verified_shots=None,
+                resource_metrics={},
+                circuit_sha256=None,
+                verifier_exit_code=process.returncode,
+                verification_parameters={},
+                runtime_seconds=time.monotonic() - started,
+                peak_memory_kb=None,
+                stdout=stdout,
+                stderr=stderr,
+                error="WSL verifier runner timed out",
+                official_run=request.official,
+                command=command,
+            )
+        response = _parse_json_output(stdout)
+        if response is None:
+            return self._error_result(
+                request,
+                "WSL verifier runner did not emit JSON",
+                VerificationStatus.ERROR,
+                command=command,
+            )
+        status = _status_from_runner(response, process.returncode)
+        parsed = response.get("parsed_json")
+        if not isinstance(parsed, dict):
+            parsed = {}
+        resource_metrics = parsed.get("resource_metrics", {})
+        if not isinstance(resource_metrics, dict):
+            resource_metrics = {}
+        verification_parameters = parsed.get("verification_parameters", {})
+        if not isinstance(verification_parameters, dict):
+            verification_parameters = {}
+        return VerificationResult(
+            benchmark_id=benchmark_id,
+            candidate_id=request.candidate_id,
+            status=status,
+            official_score=_number(parsed.get("official_score", parsed.get("score"))),
+            verified_shots=_integer(parsed.get("verified_shots")),
+            resource_metrics=resource_metrics,
+            circuit_sha256=response.get("candidate_sha256"),
+            verifier_exit_code=response.get("exit_code"),
+            verification_parameters=verification_parameters,
+            runtime_seconds=_number(response.get("runtime_seconds")),
+            peak_memory_kb=_integer(response.get("peak_memory_kb")),
+            stdout=response.get("stdout", ""),
+            stderr=response.get("stderr", stderr),
+            error=response.get("error"),
+            official_run=request.official,
+            command=command,
+        )
+
 
 def _digest(path: Path) -> str:
     if path.is_dir():
@@ -261,6 +360,24 @@ def _digest(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _to_wsl_path(path: Path) -> str:
+    resolved = path.resolve()
+    drive = resolved.drive.rstrip(":").lower()
+    if drive and len(drive) == 1:
+        return f"/mnt/{drive}{resolved.as_posix()[2:]}"
+    return str(resolved)
+
+
+def _status_from_runner(response: dict[str, Any], runner_exit_code: int) -> VerificationStatus:
+    if response.get("timed_out") or response.get("status") == "TIMEOUT":
+        return VerificationStatus.TIMEOUT
+    if runner_exit_code != 0 or response.get("status") == "ERROR":
+        return VerificationStatus.ERROR
+    if response.get("status") == "PASS":
+        return VerificationStatus.PASS
+    return VerificationStatus.FAIL
 
 
 def _parse_json_output(stdout: str) -> dict[str, Any] | None:
