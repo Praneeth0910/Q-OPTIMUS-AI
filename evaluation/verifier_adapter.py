@@ -73,7 +73,7 @@ class VerificationRequest:
     official: bool = True
     authorized: bool = False
     extra_args: tuple[str, ...] = ()
-    use_wsl_runner: bool = False
+    use_wsl_runner: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +113,15 @@ class VerifierAdapter:
     def _wsl_python(self) -> str:
         return _resolve_wsl_python()
 
+    def _should_use_wsl(self, request: VerificationRequest) -> bool:
+        """Determine whether verification should route through WSL runner."""
+        if request.use_wsl_runner is not None:
+            return request.use_wsl_runner
+        # Policy: An unspecified official verification on Windows uses WSL.
+        if sys.platform == "win32" and request.official:
+            return True
+        return False
+
     def build_command(self, request: VerificationRequest) -> tuple[str, ...]:
         benchmark = get_benchmark(request.benchmark_id)
         verifier = request.verifier_root / benchmark.verifier_path
@@ -143,17 +152,17 @@ class VerifierAdapter:
                 "Verification requires explicit authorization",
                 VerificationStatus.NOT_RUN,
             )
-        if request.use_wsl_runner:
-            return self._run_wsl(request, benchmark_id)
-        try:
-            command = self.build_command(request)
-        except (FileNotFoundError, IsADirectoryError) as exc:
-            return self._error_result(request, str(exc), VerificationStatus.ERROR)
-
-        digest = _digest(request.candidate_artifact)
-        started = time.monotonic()
         lock = self._dqi_lock if benchmark_id == "DQI" else _NullLock()
         with lock:
+            if self._should_use_wsl(request):
+                return self._run_wsl(request, benchmark_id)
+            try:
+                command = self.build_command(request)
+            except (FileNotFoundError, IsADirectoryError) as exc:
+                return self._error_result(request, str(exc), VerificationStatus.ERROR)
+
+            digest = _digest(request.candidate_artifact)
+            started = time.monotonic()
             try:
                 process = subprocess.Popen(
                     command,
@@ -301,6 +310,16 @@ class VerifierAdapter:
                 "Verification requires explicit authorization",
                 VerificationStatus.NOT_RUN,
             )
+        try:
+            pid_file = self._pid_file()
+            command = self._wsl_command(pid_file)
+        except (RuntimeError, OSError, ValueError) as exc:
+            return self._error_result(
+                request,
+                f"WSL environment resolution failed: {exc}",
+                VerificationStatus.ERROR,
+            )
+
         payload = {
             "benchmark_id": benchmark_id,
             "candidate_artifact": _to_wsl_path(request.candidate_artifact),
@@ -309,8 +328,6 @@ class VerifierAdapter:
             "extra_args": list(request.extra_args),
         }
         started = time.monotonic()
-        pid_file = self._pid_file()
-        command = self._wsl_command(pid_file)
         try:
             process = subprocess.Popen(
                 command,
@@ -321,6 +338,13 @@ class VerifierAdapter:
             )
             stdout, stderr = process.communicate(
                 json.dumps(payload), timeout=request.timeout_seconds + 5
+            )
+        except OSError as exc:
+            return self._error_result(
+                request,
+                f"Unable to execute WSL runner: {exc}",
+                VerificationStatus.ERROR,
+                command=command,
             )
         except subprocess.TimeoutExpired:
             cleanup_confirmed = _terminate_wsl_process_tree(pid_file)
@@ -387,17 +411,28 @@ class VerifierAdapter:
 
     def _wsl_command(self, pid_file: Path) -> tuple[str, ...]:
         """Build the production WSL runner command."""
+        runner_path = _wsl_runner_path()
+        env_vars = [
+            "PYTHONPATH=/home/praneeth_0910/projects/q-optimus-quantum/official/kickmix/kickmix",
+            f"Q_OPTIMUS_WSL_PID_FILE={_to_wsl_path(pid_file)}",
+        ]
+        app_root_override = os.environ.get("Q_OPTIMUS_APP_ROOT")
+        if app_root_override:
+            env_vars.append(f"Q_OPTIMUS_APP_ROOT={_to_wsl_path(Path(app_root_override))}")
         return (
             "wsl.exe",
             "-e",
             "env",
-            "PYTHONPATH=/home/praneeth_0910/projects/q-optimus-quantum/official/kickmix/kickmix",
-            f"Q_OPTIMUS_WSL_PID_FILE={_to_wsl_path(pid_file)}",
-            _resolve_wsl_python(),
-            "/mnt/d/Projects/Q-OPTIMUS-AI/evaluation/wsl_verifier_runner.py",
+            *env_vars,
+            self._wsl_python(),
+            _to_wsl_path(runner_path),
             "--request",
             "-",
         )
+
+
+def _wsl_runner_path() -> Path:
+    return (Path(__file__).resolve().parent / "wsl_verifier_runner.py").resolve()
 
 
 def _digest(path: Path) -> str:
@@ -417,9 +452,10 @@ def _digest(path: Path) -> str:
 def _to_wsl_path(path: Path) -> str:
     resolved = path.resolve()
     drive = resolved.drive.rstrip(":").lower()
-    if drive and len(drive) == 1:
-        return f"/mnt/{drive}{resolved.as_posix()[2:]}"
-    return str(resolved)
+    if drive and len(drive) == 1 and drive.isalpha():
+        posix = resolved.as_posix()
+        return f"/mnt/{drive}{posix[len(resolved.drive):]}"
+    return resolved.as_posix()
 
 
 def _status_from_runner(response: dict[str, Any], runner_exit_code: int) -> VerificationStatus:

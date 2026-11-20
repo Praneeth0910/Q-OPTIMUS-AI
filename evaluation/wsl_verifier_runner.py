@@ -36,11 +36,31 @@ except ImportError:  # pragma: no cover - exercised in environments without psut
     psutil = None
 
 
+class RunnerInputError(ValueError):
+    """Raised when a runner request violates the execution policy."""
+
+
+def _resolve_application_root() -> Path:
+    override = os.environ.get("Q_OPTIMUS_APP_ROOT")
+    if override:
+        path = Path(override).resolve()
+        if not path.is_dir():
+            raise RunnerInputError(
+                f"Q_OPTIMUS_APP_ROOT is not an existing directory: {override}"
+            )
+        if not ((path / "benchmarks").is_dir() and (path / "evaluation").is_dir()):
+            raise RunnerInputError(
+                f"Q_OPTIMUS_APP_ROOT missing expected project structure: {override}"
+            )
+        return path
+    return Path(__file__).resolve().parents[1]
+
+
 OFFICIAL_ROOT = Path(
     "/home/praneeth_0910/projects/q-optimus-quantum/official"
 ).resolve()
 KICKMIX_PATH = OFFICIAL_ROOT / "kickmix" / "kickmix"
-APPLICATION_ROOT = Path("/mnt/d/Projects/Q-OPTIMUS-AI").resolve()
+APPLICATION_ROOT = _resolve_application_root()
 DQI_LOCK_PATH = Path("/tmp/q-optimus-ai-dqi-verifier.lock")
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 0.05
@@ -50,10 +70,6 @@ DEFAULT_PID_FILE = Path(
         str(APPLICATION_ROOT / ".runtime" / "wsl-verifier.pid"),
     )
 )
-
-
-class RunnerInputError(ValueError):
-    """Raised when a runner request violates the execution policy."""
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -91,7 +107,8 @@ def _validate_request(request: dict[str, Any]) -> tuple[str, Path, tuple[str, ..
     except KeyError as exc:
         raise RunnerInputError(str(exc)) from exc
     candidate_path = Path(candidate).resolve()
-    allowed = _is_within(candidate_path, APPLICATION_ROOT) or _is_within(
+    app_root = _resolve_application_root() if "Q_OPTIMUS_APP_ROOT" in os.environ else APPLICATION_ROOT
+    allowed = _is_within(candidate_path, app_root) or _is_within(
         candidate_path, OFFICIAL_ROOT / "reference"
     )
     if not allowed:

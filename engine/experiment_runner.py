@@ -41,6 +41,7 @@ class ExperimentRunner:
         source_revision: str | None = None,
         timeout_seconds: float = 3600,
         authorized: bool = False,
+        use_wsl_runner: bool | None = None,
     ) -> VerificationResult:
         validation = validate_candidate(benchmark_id, candidate_id, artifact)
         experiment = Experiment(
@@ -84,6 +85,7 @@ class ExperimentRunner:
                     verifier_root=verifier_root,
                     timeout_seconds=timeout_seconds,
                     authorized=authorized,
+                    use_wsl_runner=use_wsl_runner,
                 )
             )
 
